@@ -1,22 +1,4 @@
-//if mqtt doesnt send the lib may need pathcing
-//todo - test waiting ~20ms after a comand has ended to send any commands
-
-//todo - option to pull line high for a short period to reset disiplay controller on error?
-
-//mqtt sending status doesnt seem to work anymore
-
-//need to check target state changing and autorestart
-
-//target temperature changes seem a bit flakey
-//picking up which temperature is which is still a bit flaky when sending temperature buttons
-
-//need to somehow ignore first button press so it doesn;t decrease temperature when it shouldnt
-//  maybe only do this if the state is flashing??
-
-//temperature lock - ok
-//auto restart -
-
-#define HOSTNAME "HotTubRemote"
+#define HOSTNAME "WiFiFan"
 
 #include <ArduinoJson.h>
 #include <IotWebConf.h>
@@ -24,27 +6,24 @@
 #include <WiFiClient.h>
 #include <ESP8266WiFi.h>
 #include <esp8266_peri.h>
-#include <WebSocketsServer.h>
 #include <ESP8266mDNS.h>
 #include <ArduinoOTA.h>
 #include <SPI.h>
-#include "HotTub.h"
-#include "HotTubApi.h"
-#include "HotTubMqtt.h"
-#include "Pins.h"
+#include "mqtt.h"
 
-#include <syslog.h>
+#include <IRrecv.h>
+#include <IRremoteESP8266.h>
+#include <IRutils.h>
 
 // -- Initial name of the Thing. Used e.g. as SSID of the own Access Point.
-const char thingName[] = "HotTubRemote";
+const char thingName[] = HOSTNAME;
 // -- Initial password to connect to the Thing, when it creates an own Access Point.
-const char wifiInitialApPassword[] = "HotTubRemote";
+const char wifiInitialApPassword[] = HOSTNAME;
 
 #define CONFIG_VERSION "beta4"
 
 DNSServer dnsServer;
 ESP8266WebServer server(80);
-WebSocketsServer webSocket = WebSocketsServer(81);
 HTTPUpdateServer httpUpdater;
 
 #define STRING_LEN 128
@@ -62,32 +41,16 @@ IotWebConfParameter mqttPortParam = IotWebConfParameter("Port", "mqttPort", mqtt
 IotWebConfParameter mqttUserParam = IotWebConfParameter("User", "mqttUser", mqttUser, STRING_LEN);
 IotWebConfParameter mqttPassParam = IotWebConfParameter("Password", "mqttPass", mqttPass, STRING_LEN);
 
-// Syslog server connection info
-#define SYSLOG_SERVER "255.255.255.255" //broadcast
-#define SYSLOG_PORT 514
+const uint16_t kRecvPin = 14; //D5
+const uint16_t kCaptureBufferSize = 1024;
+const uint8_t kTimeout = 15; // Suits most messages, while not swallowing many repeats.
 
-// This device info
-#define DEVICE_HOSTNAME "HotTubRemote"
-#define APP_NAME "-"
-WiFiUDP udpClient;
-Syslog logger(udpClient, SYSLOG_PROTO_IETF);
+IRrecv irrecv(kRecvPin, kCaptureBufferSize, kTimeout, true);
+decode_results results; // Somewhere to store the results
 
-HotTub hotTub(DATA_IN, DATA_ENABLE, DBG, &logger);
-HotTubApi hotTubApi(&server, &hotTub, &logger);
-HotTubMqtt hotTubMqtt(&hotTub, &logger);
-
-bool justStarted = true;
-
-void setupSyslog()
-{
-  logger.server(SYSLOG_SERVER, SYSLOG_PORT);
-  logger.deviceHostname(DEVICE_HOSTNAME);
-  logger.appName(APP_NAME);
-  logger.defaultPriority(LOG_DEBUG);
-}
+Mqtt mqtt();
 
 bool OTASetup = false;
-bool sendTestCommand = false;
 
 void handle_root()
 {
@@ -106,58 +69,11 @@ void handle_root()
   server.send(200, "text/html", html);
 }
 
-void onStateChange(const char *reason)
-{
-  logger.logf("MAIN->State changed - %s", reason);
-  hotTubMqtt.sendStatus();
-
-  webSocket.broadcastTXT(hotTub.getStateJson());
-}
-
-void ICACHE_RAM_ATTR handleSetTimer(uint32_t ticks)
-{
-  timer1_enable(TIM_DIV16, TIM_EDGE, TIM_SINGLE);
-  timer1_write(ticks);
-}
-
-void ICACHE_RAM_ATTR handleDataInterrupt()
-{
-  hotTub.dataInterrupt();
-}
-
-void ICACHE_RAM_ATTR handleTimerInterrupt()
-{
-  hotTub.timerInterrupt();
-}
-
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
-{
-  if (type == WStype_DISCONNECTED)
-  {
-    logger.logf("WS->[%u] Disconnected!\n", num);
-  }
-  else if (type == WStype_CONNECTED)
-  {
-    IPAddress ip = webSocket.remoteIP(num);
-    logger.logf("WS->[%u] Connected from %d.%d.%d.%d url: %s\n", num, ip[0], ip[1], ip[2], ip[3], payload);
-    webSocket.sendTXT(num, hotTub.getStateJson());
-  }
-  else if (type == WStype_TEXT)
-  {
-    logger.logf("WS->[%u] get Text: %s\n", num, payload);
-    webSocket.sendTXT(num, "Received!");
-  }
-}
-
 void setupBoard()
 {
   Serial.begin(115200);
 
-  pinMode(DBG, OUTPUT);
-  pinMode(LED, OUTPUT);
-  pinMode(DATA_IN, INPUT);
-  pinMode(DATA_OUT, OUTPUT); // Override default Serial initiation
-  pinMode(DATA_ENABLE, OUTPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
 
   pinMode(D3, OUTPUT);
   pinMode(D5, OUTPUT);
@@ -167,26 +83,17 @@ void setupBoard()
   digitalWrite(D6, LOW);
   digitalWrite(D7, LOW);
 
-  digitalWrite(DATA_OUT, LOW);
-  digitalWrite(DATA_ENABLE, LOW);
-
   WiFi.hostname(HOSTNAME);
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
-}
-
-void setupInterrupts()
-{
-  timer1_attachInterrupt(handleTimerInterrupt);
-  attachInterrupt(digitalPinToInterrupt(DATA_IN), handleDataInterrupt, RISING);
 }
 
 void setupMqtt()
 {
   if (strlen(mqttServer) > 0)
-    hotTubMqtt.setServer(mqttServer, atoi(mqttPort));
+    mqtt.setServer(mqttServer, atoi(mqttPort));
 
   if (strlen(mqttUser) > 0)
-    hotTubMqtt.setCredentials(&mqttUser[0], &mqttPass[0]);
+    mqtt.setCredentials(&mqttUser[0], &mqttPass[0]);
 }
 
 const char *otaErrorToString(ota_error_t error)
@@ -215,58 +122,63 @@ void setupOTA()
   ArduinoOTA.onStart([]() {
     const char *type = ArduinoOTA.getCommand() == U_FLASH ? "sketch" : "filesystem";
     // NOTE: if updating FS this would be the place to unmount FS using FS.end()
-    logger.logf("OTA->Start updating %s", type);
+    Serial.print("OTA->Start updating ");
+    Serial.println(type);
   });
-  ArduinoOTA.onEnd([]() { logger.logf("OTA->End"); });
+  ArduinoOTA.onEnd([]() { Serial.println("OTA->End"); });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
     int percent = (progress / (total / 100));
     if (lastOTAPercent == percent || percent % 5 != 0)
       return;
 
-    logger.logf("OTA->Progress: %u%%", percent);
+    Serial.print("OTA->Progress: ");
+    Serial.print(percent);
+    Serial.println("%");
     lastOTAPercent = percent;
   });
   ArduinoOTA.onError([](ota_error_t error) {
-    logger.logf("OTA->Error: %s", otaErrorToString(error));
+    Serial.print("OTA->Error: ");
+    Serial.println(otaErrorToString(error));
   });
   ArduinoOTA.begin();
 
-  logger.log("OTA->Setup complete.");
-}
-
-void sendConnected()
-{
-  logger.log("MAIN->HotTubRemote Connected");
+  Serial.println("OTA->Setup complete.");
 }
 
 void sendStartInfo()
 {
-  justStarted = false;
-  logger.log("MAIN->##############################");
-  logger.log("MAIN->##     HOTTUB  STARTED      ##");
-  logger.log("MAIN->##############################");
-  logger.logf("MAIN->Uptime: %lu s", millis() / 1000);
+  Serial.println("MAIN->##############################");
+  Serial.println("MAIN->##     WIFI FAN STARTED     ##");
+  Serial.println("MAIN->##############################");
 
   struct rst_info *rst = system_get_rst_info();
   const char *reasons[] = {"Normal Startup", "Hardware WDT", "Exception", "Software WDT", "Soft Restart", "Deep Sleep Awake", "External System Reset"};
 
-  logger.logf("MAIN->Restart Reason: %s (%i)", reasons[rst->reason], rst->reason);
+  Serial.print("MAIN->Restart Reason: ");
+  Serial.print(reasons[rst->reason]);
+  Serial.print(" - ");
+  Serial.println(rst->reason);
 
   if (rst->exccause > 0)
   {
-    logger.logf("MAIN->excCause: %i, excVaddr: %i, epc1: %i, epc2: %i, epc3: %i, depc: %i", rst->exccause, rst->excvaddr, rst->epc1, rst->epc2, rst->epc3, rst->depc);
+    Serial.print("MAIN->excCause: ");
+    Serial.print(rst->exccause);
+    Serial.print(", excVaddr: ");
+    Serial.print(rst->excvaddr);
+    Serial.print(", epc1: ");
+    Serial.print(rst->epc1);
+    Serial.print(", epc2: ");
+    Serial.print(rst->epc2);
+    Serial.print(", epc3: ");
+    Serial.print(rst->epc3);
+    Serial.print(", depc: ");
+    Serial.println(rst->depc);
   }
 }
 
 void wifiConnected()
 {
-  setupSyslog();
   setupOTA();
-
-  if (justStarted)
-    sendStartInfo();
-
-  sendConnected();
 
   if (strlen(mqttServer) > 0)
     setupMqtt();
@@ -274,7 +186,7 @@ void wifiConnected()
 
 void setupIotWebConf()
 {
-  iotWebConf.setStatusPin(LED);
+  iotWebConf.setStatusPin(LED_BUILTIN);
   iotWebConf.skipApStartup();
   iotWebConf.setupUpdateServer(&httpUpdater);
   iotWebConf.setWifiConnectionCallback(wifiConnected);
@@ -300,18 +212,12 @@ void setupWebServer()
   server.on("/config", [] { iotWebConf.handleConfig(); });
   server.onNotFound(handleNotFound);
   server.begin();
-  logger.log("MAIN->HTTP server started.");
-}
-
-void setupWebSocket()
-{
-  webSocket.begin();
-  webSocket.onEvent(webSocketEvent);
+  Serial.println("MAIN->HTTP server started.");
 }
 
 void mqttCallback(char *topic, byte *payload, unsigned int length)
 {
-  hotTubMqtt.callback(topic, payload, length);
+  mqtt.callback(topic, payload, length);
 }
 
 void setup(void)
@@ -319,26 +225,37 @@ void setup(void)
   setupBoard();
   setupIotWebConf();
   setupWebServer();
-  setupWebSocket();
-  hotTub.setup(onStateChange, handleSetTimer);
-  hotTubApi.setup();
-  hotTubMqtt.setup(*mqttCallback);
+  mqtt.setup(*mqttCallback);
+  irrecv.enableIRIn(); // Start the receiver
 }
 
 void loop(void)
 {
-  //digitalWrite(D6, HIGH);
-
   ArduinoOTA.handle();
-  iotWebConf.doLoop(); // doLoop should be called as frequently as possible.
-  webSocket.loop();
+  iotWebConf.doLoop();
   server.handleClient();
 
-  hotTubMqtt.loop();
-  hotTub.loop();
+  mqtt.loop();
 
-  if (millis() > 10000)
-    setupInterrupts();
+  // Check if the IR code has been received.
+  if (irrecv.decode(&results))
+  {
+    // Display a crude timestamp.
+    uint32_t now = millis();
+    Serial.printf(D_STR_TIMESTAMP " : %06u.%03u\n", now / 1000, now % 1000);
+    // Check if we got an IR message that was to big for our capture buffer.
 
-  //digitalWrite(D6, LOW);
+    if (results.overflow)
+      Serial.printf(D_WARN_BUFFERFULL "\n", kCaptureBufferSize);
+
+    // Display the library version the message was captured with.
+    Serial.println(D_STR_LIBRARY "   : v" _IRREMOTEESP8266_VERSION_ "\n");
+    // Display the basic output of what we found.
+    Serial.print(resultToHumanReadableBasic(&results));
+
+    // Output the results as source code
+    Serial.println(resultToSourceCode(&results));
+    Serial.println(); // Blank line between entries
+    yield();          // Feed the WDT (again)
+  }
 }
